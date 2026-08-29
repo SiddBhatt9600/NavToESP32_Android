@@ -40,7 +40,7 @@ class MainActivity : AppCompatActivity() {
         startButton = findViewById(R.id.startButton)
         stopButton = findViewById(R.id.stopButton)
 
-        requestLocationPermissionIfNeeded()
+        requestPermissionsIfNeeded()
 
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
 
@@ -74,13 +74,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun requestLocationPermissionIfNeeded() {
+    private fun requestPermissionsIfNeeded() {
+        val needed = mutableListOf<String>()
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 100
-            )
+            != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+            != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (needed.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), 100)
         }
     }
 
@@ -89,7 +94,7 @@ class MainActivity : AppCompatActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) {
             statusText.text = "Location permission not granted"
-            requestLocationPermissionIfNeeded()
+            requestPermissionsIfNeeded()
             return
         }
 

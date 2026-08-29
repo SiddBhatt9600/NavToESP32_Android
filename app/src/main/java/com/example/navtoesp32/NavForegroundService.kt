@@ -1,6 +1,8 @@
 package com.example.navtoesp32
 
 import android.app.*
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -24,8 +26,9 @@ class NavForegroundService : Service() {
         const val EXTRA_DEST_TEXT = "dest_text"
         const val EXTRA_API_KEY = "api_key"
 
-        // Simple in-process callback so MainActivity can still update its UI
-        // while the service does the real work. Cleared in onDestroy.
+        // Name your ESP32 advertises via SerialBT.begin("ESP32_Nav") — must match exactly.
+        const val ESP32_DEVICE_NAME = "ESP32_Nav"
+
         var onPayload: ((NavPayload) -> Unit)? = null
         var onStatus: ((String) -> Unit)? = null
     }
@@ -33,12 +36,15 @@ class NavForegroundService : Service() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var locationCallback: LocationCallback? = null
     private lateinit var tracker: RouteTracker
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-
     private lateinit var destination: LatLon
     private lateinit var repo: RouteRepository
     private var consecutiveOffRouteCount = 0
-    private val offRouteRerouteThreshold = 3 // e.g. 3 consecutive off-route fixes (~6s at 2s interval)
+    private val offRouteRerouteThreshold = 3
+
+    private val btSender = BtSppSender()
+    private var btConnected = false
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     override fun onCreate() {
         super.onCreate()
@@ -59,22 +65,22 @@ class NavForegroundService : Service() {
 
         startForeground(NOTIFICATION_ID, buildNotification("Starting navigation..."))
 
-        // FIX 1: Assign directly to the member field, don't use 'val repo ='
         repo = RouteRepository(buildOrsApi(), apiKey)
 
         serviceScope.launch {
             try {
                 onStatus?.invoke("Looking up \"$destText\"...")
-                Log.d("NAV", "Geocoding text: '$destText'")
-
-                // FIX 2: Assign directly to the member field, don't use 'val destination ='
-                destination = repo.geocodeAddress(destText)
+                val dest = repo.geocodeAddress(destText)
+                destination = dest
 
                 onStatus?.invoke("Fetching route...")
-                val steps = repo.fetchRoute(LatLon(originLat, originLon), destination)
+                val steps = repo.fetchRoute(LatLon(originLat, originLon), dest)
                 Log.d("NAV", "route fetched: ${steps.size} steps")
 
                 tracker = RouteTracker(steps)
+                onStatus?.invoke("Connecting to ESP32...")
+                connectToEsp32()
+
                 onStatus?.invoke("Navigating to $destText")
                 startLocationUpdates()
 
@@ -91,6 +97,48 @@ class NavForegroundService : Service() {
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Looks up the paired ESP32 by name and connects over classic BT SPP.
+     * Non-fatal if it fails — navigation still works and updates the phone
+     * UI/notification, it just won't reach the ESP32 until reconnected.
+     */
+    private suspend fun connectToEsp32() {
+        if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.w("NAV", "Missing BLUETOOTH_CONNECT permission, skipping ESP32 connection")
+            onStatus?.invoke("Bluetooth permission missing — display won't update")
+            return
+        }
+
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        if (adapter == null || !adapter.isEnabled) {
+            Log.w("NAV", "Bluetooth not available/enabled")
+            onStatus?.invoke("Bluetooth is off — enable it to use the display")
+            return
+        }
+
+        val device: BluetoothDevice? = try {
+            adapter.bondedDevices.firstOrNull { it.name == ESP32_DEVICE_NAME }
+        } catch (e: SecurityException) {
+            Log.e("NAV", "SecurityException reading bonded devices: ${e.message}", e)
+            null
+        }
+
+        if (device == null) {
+            Log.w("NAV", "Paired device '$ESP32_DEVICE_NAME' not found. Pair it in phone Bluetooth settings first.")
+            onStatus?.invoke("ESP32 not paired — pair \"$ESP32_DEVICE_NAME\" in Bluetooth settings")
+            return
+        }
+
+        btConnected = btSender.connect(device)
+        if (!btConnected) {
+            Log.w("NAV", "Failed to connect to ESP32")
+            onStatus?.invoke("Couldn't connect to ESP32 — check it's powered on and nearby")
+        } else {
+            Log.d("NAV", "ESP32 connected")
+        }
     }
 
     private fun startLocationUpdates() {
@@ -111,6 +159,10 @@ class NavForegroundService : Service() {
                 Log.d("NAV", payload.toString())
                 onPayload?.invoke(payload)
                 updateNotification("${payload.turn} onto ${payload.roadName} — ${payload.distanceToTurnM}m")
+
+                if (btConnected) {
+                    serviceScope.launch { btSender.send(payload) }
+                }
 
                 if (payload.offRoute) {
                     consecutiveOffRouteCount++
@@ -173,11 +225,9 @@ class NavForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         locationCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
+        btSender.disconnect()
+        btConnected = false
         onStatus?.invoke("Navigation stopped")
-
-        // Clear callbacks and cancel scope jobs
-//        onPayload = null
-//        onStatus = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

@@ -21,6 +21,7 @@ import retrofit2.http.Header
 import kotlin.math.*
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
+import com.google.gson.annotations.SerializedName
 
 // ---------- 1. ORS API contract ----------
 
@@ -63,6 +64,7 @@ data class OrsStep(
     val way_points: List<Int>   // [startIdx, endIdx] into the geometry.coordinates array
 )
 
+
 fun buildOrsApi(): OrsApi {
     val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -93,11 +95,11 @@ data class Step(
 
 // What actually gets sent to the ESP32
 data class NavPayload(
-    val turn: String,           // short code, e.g. "L", "R", "STRAIGHT"
-    val roadName: String,
-    val distanceToTurnM: Int,
-    val etaMinutes: Int,
-    val offRoute: Boolean
+    @SerializedName("turn") val turn: String,
+    @SerializedName("road") val roadName: String,
+    @SerializedName("dist") val distanceToTurnM: Int,
+    @SerializedName("eta") val etaMinutes: Int,
+    @SerializedName("off") val offRoute: Boolean
 )
 
 // ---------- 3. Fetch + parse route once per trip ----------
