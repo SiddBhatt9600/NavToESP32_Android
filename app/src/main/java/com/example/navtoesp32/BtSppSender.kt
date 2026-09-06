@@ -63,18 +63,17 @@ class BtSppSender {
      * Safe to call from the main thread's location callback — internally
      * hops to IO dispatcher. Fire-and-forget; failures are logged, not thrown.
      */
-    suspend fun send(payload: NavPayload) = withContext(Dispatchers.IO) {
-        val stream = outputStream ?: run {
-            Log.w(TAG, "Not connected, dropping payload")
-            return@withContext
-        }
+    suspend fun send(payload: NavPayload): Boolean = withContext(Dispatchers.IO) {
+        val stream = outputStream ?: return@withContext false
         try {
             val json = gson.toJson(payload)
             stream.write((json + "\n").toByteArray(Charsets.UTF_8))
             stream.flush()
+            true
         } catch (e: IOException) {
             Log.e(TAG, "Send failed, connection likely dropped: ${e.message}", e)
             closeQuietly()
+            false
         }
     }
 

@@ -1,86 +1,13 @@
 package com.example.navtoesp32
 
-/**
- * ORS routing + on-device step tracking sketch.
- *
- * Flow:
- *  1. RouteRepository.fetchRoute() -> one ORS API call, parses steps + geometry.
- *  2. RouteTracker.onLocationUpdate() -> called on every GPS fix (no network call).
- *     Figures out current step, distance-to-turn, ETA, and off-route status.
- *  3. NavPayload is what you serialize to JSON and push to the ESP32.
- *
- * Dependencies assumed: Retrofit + Moshi/Gson, kotlinx-coroutines.
- * Add your ORS API key as a build config field or resource, don't hardcode in real code.
- */
-
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.http.GET
-import retrofit2.http.Query
-import retrofit2.http.Header
-import kotlin.math.*
-import okhttp3.OkHttpClient
-import java.util.concurrent.TimeUnit
 import com.google.gson.annotations.SerializedName
+import kotlin.math.*
 
-// ---------- 1. ORS API contract ----------
-
-interface OrsApi {
-    // ORS GeoJSON directions endpoint
-    @GET("v2/directions/driving-car")
-    suspend fun getRoute(
-        @Query("api_key") apiKey: String,
-        @Query("start") start: String,   // "lon,lat"
-        @Query("end") end: String,       // "lon,lat"
-        @Query("instructions") instructions: Boolean = true
-    ): OrsResponse
-
-    @GET("geocode/search")
-    suspend fun geocode(
-        @Header("Authorization") apiKey: String,
-        @Query("text") text: String,
-        @Query("size") size: Int = 1
-    ): GeocodeResponse
-}
-
-// --- Geocoding (address text -> lat/lon) ---
-
-data class GeocodeResponse(val features: List<GeocodeFeature>)
-data class GeocodeFeature(val geometry: GeocodeGeometry)
-data class GeocodeGeometry(val coordinates: List<Double>) // [lon, lat]
-
-// Trimmed response shape — ORS returns more fields, we only model what we use.
-data class OrsResponse(val features: List<OrsFeature>)
-data class OrsFeature(val geometry: OrsGeometry, val properties: OrsProperties)
-data class OrsGeometry(val coordinates: List<List<Double>>) // [ [lon,lat], ... ] full route polyline
-data class OrsProperties(val segments: List<OrsSegment>)
-data class OrsSegment(val steps: List<OrsStep>, val duration: Double, val distance: Double)
-data class OrsStep(
-    val instruction: String,
-    val name: String,          // road name, "-" if unnamed
-    val distance: Double,       // meters, length of this step
-    val duration: Double,       // seconds
-    val type: Int,              // maneuver code (0=left,1=right,etc — ORS docs have the full table)
-    val way_points: List<Int>   // [startIdx, endIdx] into the geometry.coordinates array
-)
-
-
-fun buildOrsApi(): OrsApi {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
-
-    return Retrofit.Builder()
-        .baseUrl("https://api.openrouteservice.org/")
-        .client(client)
-        .addConverterFactory(GsonConverterFactory.create())
-        .build()
-        .create(OrsApi::class.java)
-}
-
-// ---------- 2. Domain model used internally ----------
+/**
+ * Provider-agnostic navigation model. Previously shared this file with ORS's
+ * OrsApi/RouteRepository — those are removed now that Mappls has fully
+ * replaced ORS (see MapplsNavTracker.kt for the routing/geocoding layer).
+ */
 
 data class LatLon(val lat: Double, val lon: Double)
 
@@ -90,10 +17,9 @@ data class Step(
     val distanceMeters: Double,
     val durationSeconds: Double,
     val maneuverType: Int,
-    val polyline: List<LatLon>   // just this step's slice of the route geometry
+    val polyline: List<LatLon>
 )
 
-// What actually gets sent to the ESP32
 data class NavPayload(
     @SerializedName("turn") val turn: String,
     @SerializedName("road") val roadName: String,
@@ -102,53 +28,11 @@ data class NavPayload(
     @SerializedName("off") val offRoute: Boolean
 )
 
-// ---------- 3. Fetch + parse route once per trip ----------
-
-class RouteRepository(private val api: OrsApi, private val apiKey: String) {
-
-    suspend fun fetchRoute(origin: LatLon, destination: LatLon): List<Step> {
-        val resp = api.getRoute(
-            apiKey = apiKey,
-            start = "${origin.lon},${origin.lat}",
-            end = "${destination.lon},${destination.lat}"
-        )
-        val feature = resp.features.first()
-        val coords = feature.geometry.coordinates.map { LatLon(lat = it[1], lon = it[0]) }
-        val segment = feature.properties.segments.first()
-
-        return segment.steps.map { s ->
-            val (from, to) = s.way_points
-            Step(
-                instruction = s.instruction,
-                roadName = s.name.ifBlank { "Unnamed road" },
-                distanceMeters = s.distance,
-                durationSeconds = s.duration,
-                maneuverType = s.type,
-                polyline = coords.subList(from, (to + 1).coerceAtMost(coords.size))
-            )
-        }
-    }
-
-    suspend fun geocodeAddress(address: String): LatLon {
-        val resp = api.geocode(apiKey = apiKey, text = address)
-        val coords = resp.features.firstOrNull()?.geometry?.coordinates
-            ?: throw IllegalStateException("No results found for \"$address\"")
-        return LatLon(lat = coords[1], lon = coords[0])
-    }
-}
-
-// ---------- 4. Local step tracking (runs on every GPS fix, no network) ----------
-
 class RouteTracker(private val steps: List<Step>) {
 
     private var currentStepIndex = 0
     private val offRouteThresholdMeters = 35.0
 
-    /**
-     * Call this from your location callback (e.g. every 1-2s).
-     * Returns the payload to send to the ESP32, or null if nothing changed
-     * enough to warrant re-sending (avoid spamming BT/WiFi).
-     */
     fun onLocationUpdate(current: LatLon): NavPayload? {
         if (currentStepIndex >= steps.size) return null
 
@@ -169,19 +53,22 @@ class RouteTracker(private val steps: List<Step>) {
             etaMinutes = etaMinutes,
             offRoute = isOffRoute
         )
-        // Caller decides: if isOffRoute stays true for N consecutive updates,
-        // trigger RouteRepository.fetchRoute() again from current position.
     }
 
     private fun advanceStepIfNeeded(current: LatLon) {
-        // If we're closer to the *next* step's start than to anything in the
-        // current step, and within a tight radius of the current step's end,
-        // move on. Simple heuristic — good enough for turn-by-turn granularity.
-        val step = steps[currentStepIndex]
-        val distToEnd = distanceToPoint(current, step.polyline.last())
-        if (distToEnd < 15.0 && currentStepIndex < steps.size - 1) {
-            currentStepIndex++
+        val lookahead = 3
+        var bestIndex = currentStepIndex
+        var bestDist = minDistanceToPolyline(current, steps[currentStepIndex].polyline)
+
+        for (i in (currentStepIndex + 1) until minOf(currentStepIndex + lookahead, steps.size)) {
+            val dist = minDistanceToPolyline(current, steps[i].polyline)
+            if (dist < bestDist) {
+                bestDist = dist
+                bestIndex = i
+            }
         }
+
+        currentStepIndex = bestIndex
     }
 
     private fun remainingDuration(current: LatLon): Double {
@@ -193,8 +80,8 @@ class RouteTracker(private val steps: List<Step>) {
     }
 
     private fun maneuverToCode(type: Int): String = when (type) {
-        0 -> "L"       // left
-        1 -> "R"       // right
+        0 -> "L"
+        1 -> "R"
         2 -> "SHARP_L"
         3 -> "SHARP_R"
         4 -> "SLIGHT_L"
@@ -205,8 +92,6 @@ class RouteTracker(private val steps: List<Step>) {
         11 -> "DEPART"
         else -> "STRAIGHT"
     }
-
-    // ---- geometry helpers ----
 
     private fun distanceToPoint(a: LatLon, b: LatLon): Double {
         val R = 6371000.0
@@ -228,8 +113,6 @@ class RouteTracker(private val steps: List<Step>) {
         return minDist
     }
 
-    // Approximate point-to-segment distance using equirectangular projection
-    // (fine for short segments at typical road-navigation scale).
     private fun distanceToSegment(p: LatLon, a: LatLon, b: LatLon): Double {
         val latRef = Math.toRadians(a.lat)
         fun toXY(pt: LatLon): Pair<Double, Double> {
@@ -249,21 +132,3 @@ class RouteTracker(private val steps: List<Step>) {
         return sqrt((px - projX).pow(2) + (py - projY).pow(2))
     }
 }
-
-// ---------- 5. Wiring it together (pseudo usage) ----------
-
-/*
-val api = buildOrsApi()
-val repo = RouteRepository(api, apiKey = "YOUR_ORS_KEY")
-
-// once, when trip starts:
-val steps = repo.fetchRoute(origin, destination)
-val tracker = RouteTracker(steps)
-
-// in your FusedLocationProviderClient callback:
-fun onLocation(loc: Location) {
-    val payload = tracker.onLocationUpdate(LatLon(loc.latitude, loc.longitude)) ?: return
-    val json = Gson().toJson(payload)
-    sendToEsp32(json) // your BT/BLE/WiFi send function
-}
-*/

@@ -24,7 +24,8 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        buildConfigField("String", "ORS_API_KEY", "\"${localProperties.getProperty("ORS_API_KEY")}\"")
+        // buildConfigField("String", "ORS_API_KEY", "\"${localProperties.getProperty("ORS_API_KEY")}\"")
+        buildConfigField("String", "MAPPLS_API_KEY", "\"${localProperties.getProperty("MAPPLS_API_KEY")}\"")
     }
 
     buildFeatures {
@@ -49,6 +50,7 @@ dependencies {
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
     implementation("com.google.android.gms:play-services-location:21.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
     implementation(libs.androidx.activity.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.androidx.constraintlayout)

@@ -14,6 +14,7 @@ import com.google.android.gms.location.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 class NavForegroundService : Service() {
@@ -24,9 +25,9 @@ class NavForegroundService : Service() {
         const val EXTRA_ORIGIN_LAT = "origin_lat"
         const val EXTRA_ORIGIN_LON = "origin_lon"
         const val EXTRA_DEST_TEXT = "dest_text"
+        const val EXTRA_DEST_ELOC = "dest_eloc" // optional — set when user picked an autosuggest result
         const val EXTRA_API_KEY = "api_key"
 
-        // Name your ESP32 advertises via SerialBT.begin("ESP32_Nav") — must match exactly.
         const val ESP32_DEVICE_NAME = "ESP32_Nav"
 
         var onPayload: ((NavPayload) -> Unit)? = null
@@ -36,13 +37,14 @@ class NavForegroundService : Service() {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var locationCallback: LocationCallback? = null
     private lateinit var tracker: RouteTracker
-    private lateinit var destination: LatLon
-    private lateinit var repo: RouteRepository
+    private lateinit var destinationEloc: String
+    private lateinit var repo: MapplsRouteRepository
     private var consecutiveOffRouteCount = 0
     private val offRouteRerouteThreshold = 3
 
     private val btSender = BtSppSender()
     private var btConnected = false
+    private var isActive = true
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -61,20 +63,25 @@ class NavForegroundService : Service() {
         val originLat = intent?.getDoubleExtra(EXTRA_ORIGIN_LAT, 0.0) ?: return START_NOT_STICKY
         val originLon = intent.getDoubleExtra(EXTRA_ORIGIN_LON, 0.0)
         val destText = intent.getStringExtra(EXTRA_DEST_TEXT) ?: return START_NOT_STICKY
+        val preResolvedEloc = intent.getStringExtra(EXTRA_DEST_ELOC)
         val apiKey = intent.getStringExtra(EXTRA_API_KEY) ?: return START_NOT_STICKY
 
         startForeground(NOTIFICATION_ID, buildNotification("Starting navigation..."))
 
-        repo = RouteRepository(buildOrsApi(), apiKey)
+        repo = MapplsRouteRepository(buildMapplsRouteApi(), buildMapplsSearchApi(), apiKey)
 
         serviceScope.launch {
             try {
-                onStatus?.invoke("Looking up \"$destText\"...")
-                val dest = repo.geocodeAddress(destText)
-                destination = dest
+                val destEloc = if (preResolvedEloc != null) {
+                    preResolvedEloc
+                } else {
+                    onStatus?.invoke("Looking up \"$destText\"...")
+                    repo.geocodeAddress(destText)
+                }
+                destinationEloc = destEloc
 
                 onStatus?.invoke("Fetching route...")
-                val steps = repo.fetchRoute(LatLon(originLat, originLon), dest)
+                val steps = repo.fetchRoute(LatLon(originLat, originLon), destEloc)
                 Log.d("NAV", "route fetched: ${steps.size} steps")
 
                 tracker = RouteTracker(steps)
@@ -99,11 +106,6 @@ class NavForegroundService : Service() {
         return START_STICKY
     }
 
-    /**
-     * Looks up the paired ESP32 by name and connects over classic BT SPP.
-     * Non-fatal if it fails — navigation still works and updates the phone
-     * UI/notification, it just won't reach the ESP32 until reconnected.
-     */
     private suspend fun connectToEsp32() {
         if (ActivityCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT)
             != PackageManager.PERMISSION_GRANTED) {
@@ -149,9 +151,13 @@ class NavForegroundService : Service() {
             return
         }
 
-        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000L).build()
+        val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
+            .setMinUpdateIntervalMillis(500L) // allow faster updates if GPS has them ready sooner
+            .setWaitForAccurateLocation(false) // don't delay the first fix waiting for high precision
+            .build()
         val callback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
+                if (!isActive) return
                 val loc = result.lastLocation ?: return
                 val currentLatLon = LatLon(loc.latitude, loc.longitude)
                 val payload = tracker.onLocationUpdate(currentLatLon) ?: return
@@ -160,8 +166,18 @@ class NavForegroundService : Service() {
                 onPayload?.invoke(payload)
                 updateNotification("${payload.turn} onto ${payload.roadName} — ${payload.distanceToTurnM}m")
 
+                if (!btConnected) {
+                    serviceScope.launch { connectToEsp32() }
+                }
+
                 if (btConnected) {
-                    serviceScope.launch { btSender.send(payload) }
+                    serviceScope.launch {
+                        val success = btSender.send(payload)
+                        if (!success) {
+                            btConnected = false
+                            Log.w("NAV", "BT send failed, will attempt reconnect on next update")
+                        }
+                    }
                 }
 
                 if (payload.offRoute) {
@@ -183,7 +199,7 @@ class NavForegroundService : Service() {
         onStatus?.invoke("Off route — recalculating...")
         serviceScope.launch {
             try {
-                val newSteps = repo.fetchRoute(currentLocation, destination)
+                val newSteps = repo.fetchRoute(currentLocation, destinationEloc)
                 tracker = RouteTracker(newSteps)
                 onStatus?.invoke("Rerouted")
                 Log.d("NAV", "Rerouted: ${newSteps.size} new steps")
@@ -224,10 +240,12 @@ class NavForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isActive = false
         locationCallback?.let { fusedLocationClient.removeLocationUpdates(it) }
         btSender.disconnect()
         btConnected = false
         onStatus?.invoke("Navigation stopped")
+        serviceScope.cancel() // kill any in-flight fetchRoute/reroute/reconnect coroutines
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

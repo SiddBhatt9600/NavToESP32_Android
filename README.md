@@ -2,7 +2,7 @@
 
 The phone-side half of NAV2ESP: a navigation app that fetches routes from OpenStreetMap-based routing, tracks your progress locally, and streams turn-by-turn updates to a companion ESP32 + TFT display over Bluetooth.
 
-The ESP32 firmware that receives this data lives in a separate repo: https://github.com/SiddBhatt9600/NavToESP32_ESP32.
+The ESP32 firmware that receives this data lives in a separate repo: **[NAV2ESP-ESP32](#)** *(link to your ESP32 repo here)*.
 
 ## How it works
 
@@ -78,3 +78,7 @@ One newline-terminated JSON object per update, over Bluetooth SPP:
 - Wi-Fi/WebSocket transport option
 - On-display mini-map rendering (vector route overlay)
 - Offline map tiles via SD card, for areas with no phone connectivity
+
+## License
+
+MIT — see [LICENSE](LICENSE).
